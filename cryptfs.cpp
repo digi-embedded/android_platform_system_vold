@@ -64,6 +64,11 @@
 #include "Keymaster.h"
 #include "android-base/properties.h"
 #include <bootloader_message/bootloader_message.h>
+
+#ifdef TARGET_USES_CAAM_BASED_FDE
+#include "cryptfs_hw.h"
+#endif
+
 extern "C" {
 #include <crypto_scrypt.h>
 }
@@ -97,7 +102,11 @@ extern "C" {
 #define RETRY_MOUNT_ATTEMPTS 10
 #define RETRY_MOUNT_DELAY_SECONDS 1
 
+#ifdef TARGET_USES_CAAM_BASED_FDE
+static unsigned char saved_master_key[KEYSIZE_BYTES];
+#else
 static unsigned char saved_master_key[KEY_LEN_BYTES];
+#endif
 static char *saved_mount_point;
 static int  master_key_saved = 0;
 static struct crypt_persist_data *persist_data = NULL;
@@ -1585,8 +1594,12 @@ static int test_mount_encrypted_fs(struct crypt_mnt_ftr* crypt_ftr,
   orig_failed_decrypt_count = crypt_ftr->failed_decrypt_count;
 
   if (! (crypt_ftr->flags & CRYPT_MNT_KEY_UNENCRYPTED) ) {
+#ifdef TARGET_USES_CAAM_BASED_FDE
+    if (caam_decrypt_master_key(crypt_ftr->master_key, decrypted_master_key)) {
+#else
     if (decrypt_master_key(passwd, decrypted_master_key, crypt_ftr,
                            &intermediate_key, &intermediate_key_size)) {
+#endif
       SLOGE("Failed to decrypt master key\n");
       rc = -1;
       goto errout;
@@ -1604,6 +1617,7 @@ static int test_mount_encrypted_fs(struct crypt_mnt_ftr* crypt_ftr,
      goto errout;
   }
 
+#ifndef TARGET_USES_CAAM_BASED_FDE
   /* Work out if the problem is the password or the data */
   unsigned char scrypted_intermediate_key[sizeof(crypt_ftr->
                                                  scrypted_intermediate_key)];
@@ -1619,7 +1633,9 @@ static int test_mount_encrypted_fs(struct crypt_mnt_ftr* crypt_ftr,
                         sizeof(scrypted_intermediate_key)) == 0) {
     SLOGI("Password matches");
     rc = 0;
-  } else {
+  } else
+#endif
+  {
     /* Try mounting the file system anyway, just in case the problem's with
      * the footer, not the key. */
     snprintf(tmp_mount_point, sizeof(tmp_mount_point), "%s/tmp_mnt",
@@ -1651,12 +1667,17 @@ static int test_mount_encrypted_fs(struct crypt_mnt_ftr* crypt_ftr,
 
     /* Also save a the master key so we can reencrypted the key
      * the key when we want to change the password on it. */
+#ifdef TARGET_USES_CAAM_BASED_FDE
+    memcpy(saved_master_key, decrypted_master_key, KEYSIZE_BYTES);
+#else
     memcpy(saved_master_key, decrypted_master_key, KEY_LEN_BYTES);
+#endif
     saved_mount_point = strdup(mount_point);
     master_key_saved = 1;
     SLOGD("%s(): Master key saved\n", __FUNCTION__);
     rc = 0;
 
+#ifndef TARGET_USES_CAAM_BASED_FDE
     // Upgrade if we're not using the latest KDF.
     use_keymaster = keymaster_check_compatibility();
     if (crypt_ftr->kdf_type == KDF_SCRYPT_KEYMASTER) {
@@ -1688,6 +1709,7 @@ static int test_mount_encrypted_fs(struct crypt_mnt_ftr* crypt_ftr,
           rc = 0;
         }
     }
+#endif
   }
 
  errout:
@@ -1854,6 +1876,13 @@ int cryptfs_verify_passwd(char *passwd)
         /* If the device has no password, then just say the password is valid */
         rc = 0;
     } else {
+#ifdef TARGET_USES_CAAM_BASED_FDE
+        rc = verify_base64_password(passwd);
+        if (rc < 0) {
+            SLOGE("Error failed to verify password\n");
+            return -1;
+        }
+#else
         decrypt_master_key(passwd, decrypted_master_key, &crypt_ftr, 0, 0);
         if (!memcmp(decrypted_master_key, saved_master_key, crypt_ftr.keysize)) {
             /* They match, the password is correct */
@@ -1863,6 +1892,7 @@ int cryptfs_verify_passwd(char *passwd)
             sleep(1);
             rc = 1;
         }
+#endif
     }
 
     return rc;
@@ -1882,7 +1912,11 @@ static int cryptfs_init_crypt_mnt_ftr(struct crypt_mnt_ftr *ftr)
     ftr->major_version = CURRENT_MAJOR_VERSION;
     ftr->minor_version = CURRENT_MINOR_VERSION;
     ftr->ftr_size = sizeof(struct crypt_mnt_ftr);
+#ifdef TARGET_USES_CAAM_BASED_FDE
+    ftr->keysize = KEYSIZE_BYTES;
+#else
     ftr->keysize = KEY_LEN_BYTES;
+#endif
 
     switch (keymaster_check_compatibility()) {
     case 1:
@@ -2080,7 +2114,11 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, const char *passwd,
 {
     int how = 0;
     char crypto_blkdev[MAXPATHLEN], real_blkdev[MAXPATHLEN];
+#ifdef TARGET_USES_CAAM_BASED_FDE
+    unsigned char decrypted_master_key[KEYSIZE_BYTES];
+#else
     unsigned char decrypted_master_key[KEY_LEN_BYTES];
+#endif
     int rc=-1, i;
     struct crypt_mnt_ftr crypt_ftr;
     struct crypt_persist_data *pdata;
@@ -2253,6 +2291,13 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, const char *passwd,
         crypt_ftr.crypt_type = crypt_type;
         strlcpy((char *)crypt_ftr.crypto_type_name, "aes-cbc-essiv:sha256", MAX_CRYPTO_TYPE_NAME_LEN);
 
+#ifdef TARGET_USES_CAAM_BASED_FDE
+        /* Make a CAAM-protected encrypted master key */
+        if (create_caam_encrypted_random_key(crypt_ftr.master_key)) {
+            SLOGE("Cannot create CAAM protected encrypted master key\n");
+            goto error_shutting_down;
+        }
+#else
         /* Make an encrypted master key */
         if (create_encrypted_random_key(onlyCreateHeader ? DEFAULT_PASSWORD : passwd,
                                         crypt_ftr.master_key, crypt_ftr.salt, &crypt_ftr)) {
@@ -2268,6 +2313,7 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, const char *passwd,
             encrypt_master_key(passwd, crypt_ftr.salt, fake_master_key,
                                encrypted_fake_master_key, &crypt_ftr);
         }
+#endif
 
         /* Write the key to the end of the partition */
         put_crypt_ftr_and_key(&crypt_ftr);
@@ -2304,7 +2350,11 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, const char *passwd,
          */
     }
 
+#ifdef TARGET_USES_CAAM_BASED_FDE
+    caam_decrypt_master_key(crypt_ftr.master_key, decrypted_master_key);
+#else
     decrypt_master_key(passwd, decrypted_master_key, &crypt_ftr, 0, 0);
+#endif
     create_crypto_blk_dev(&crypt_ftr, decrypted_master_key, real_blkdev, crypto_blkdev,
                           CRYPTO_BLOCK_DEVICE);
 
@@ -2449,6 +2499,10 @@ int cryptfs_enable_default(char *howarg, int no_ui)
 
 int cryptfs_changepw(int crypt_type, const char *newpw)
 {
+#ifdef TARGET_USES_CAAM_BASED_FDE
+    SLOGE("cryptfs_changepw not supported with CAAM-based encryption");
+    return -1;
+#else
     if (e4crypt_is_native()) {
         SLOGE("cryptfs_changepw not valid for file encryption");
         return -1;
@@ -2490,6 +2544,7 @@ int cryptfs_changepw(int crypt_type, const char *newpw)
     put_crypt_ftr_and_key(&crypt_ftr);
 
     return 0;
+#endif
 }
 
 static unsigned int persist_get_max_entries(int encrypted) {

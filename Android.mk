@@ -92,6 +92,15 @@ ifeq ($(TARGET_USERIMAGES_USE_EXT4), true)
   endif
 endif
 
+-include $(TARGET_BOARD_LOCALCONFIG_MK)
+ifeq ($(TARGET_CAAM_ENCRYPTION_SUPPORT), true)
+  # Build the library even when TF is not enabled
+  common_shared_libraries += libcryptfs_hw
+  ifeq ($(TARGET_USES_CAAM_BASED_FDE), true)
+    vold_cflags += -DTARGET_USES_CAAM_BASED_FDE
+  endif
+endif
+
 include $(CLEAR_VARS)
 
 LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
